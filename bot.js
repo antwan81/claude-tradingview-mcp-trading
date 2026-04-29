@@ -217,12 +217,15 @@ async function checkHigherTimeframe(symbol) {
   }
 }
 
-// ─── Improvement 4: Time Filter (skip 00:00–06:00 UTC) ───────────────────────
+// ─── Improvement 4: Time Filter (skip 01:00–05:59 UTC, unless RSI > 80) ───────
 
-function checkTradingHours() {
+function checkTradingHours(rsi3 = null) {
   const hourUTC = new Date().getUTCHours();
-  const pass = hourUTC >= 6 || hourUTC === 0; // allow all except 01:00–05:59 UTC
-  return { pass: !(hourUTC >= 1 && hourUTC < 6), hourUTC };
+  const inLowLiqWindow = hourUTC >= 1 && hourUTC < 6;
+  if (!inLowLiqWindow) return { pass: true, override: false, hourUTC };
+  // Exception: strong RSI signal (>80 short or <20 long) overrides the window
+  const strongSignal = rsi3 !== null && (rsi3 > 80 || rsi3 < 20);
+  return { pass: strongSignal, override: strongSignal, hourUTC, rsi3 };
 }
 
 // ─── Improvement 5: ATR Position Sizing ──────────────────────────────────────
@@ -247,10 +250,18 @@ function calcATRPositionSize(price, atr, portfolioValue, maxTradeSize) {
 // ─── Improvement 6: Correlation Filter ───────────────────────────────────────
 
 function checkCorrelation(symbol, executedSymbols) {
-  const correlated = ["BTCUSDT", "ETHUSDT"];
-  const alreadyTraded = executedSymbols.filter((s) => correlated.includes(s));
-  if (correlated.includes(symbol) && alreadyTraded.length > 0) {
-    return { pass: false, reason: `Already traded correlated asset ${alreadyTraded[0]} this run` };
+  // Group highly correlated assets — only one per group per run
+  const groups = [
+    ["BTCUSDT", "ETHUSDT"],           // BTC/ETH — tightly correlated
+    ["SOLUSDT", "SUIUSDT", "AVAXUSDT"], // L1 alts — moderately correlated
+  ];
+  for (const group of groups) {
+    if (group.includes(symbol)) {
+      const alreadyTraded = executedSymbols.find((s) => group.includes(s));
+      if (alreadyTraded) {
+        return { pass: false, reason: `Already traded correlated asset ${alreadyTraded} this run` };
+      }
+    }
   }
   return { pass: true };
 }
@@ -636,15 +647,6 @@ async function run() {
   const watchlist = rules.watchlist || [CONFIG.symbol];
   const executedThisRun = [];
 
-  // ── Improvement 4: Time Filter ───────────────────────────────────────────
-  const timeCheck = checkTradingHours();
-  console.log("\n── Time Filter ──────────────────────────────────────────\n");
-  if (!timeCheck.pass) {
-    console.log(`🚫 Low-liquidity window — ${timeCheck.hourUTC}:00 UTC (01:00–05:59 blocked). Skipping all trades.`);
-    return;
-  }
-  console.log(`✅ Trading hours OK — ${timeCheck.hourUTC}:00 UTC`);
-
   for (const symbol of watchlist) {
     console.log(`\n${"═".repeat(59)}`);
     console.log(`  Symbol: ${symbol} | Timeframe: ${CONFIG.timeframe}`);
@@ -671,6 +673,20 @@ async function run() {
     if (vwap === null || rsi3 === null) {
       console.log("\n⚠️  Not enough data to calculate indicators. Skipping.");
       continue;
+    }
+
+    // ── Improvement 4: Time Filter (RSI-aware) ────────────────────────────
+    console.log("\n── Time Filter ──────────────────────────────────────────\n");
+    const timeCheck = checkTradingHours(rsi3);
+    if (!timeCheck.pass) {
+      console.log(`🚫 Low-liquidity window — ${timeCheck.hourUTC}:00 UTC (01:00–05:59 blocked).`);
+      console.log(`   RSI(3) ${rsi3.toFixed(2)} — not strong enough to override (needs >80 or <20).`);
+      continue;
+    }
+    if (timeCheck.override) {
+      console.log(`⚡ Low-liquidity window overridden — RSI(3) ${rsi3.toFixed(2)} is a strong signal (>80 or <20).`);
+    } else {
+      console.log(`✅ Trading hours OK — ${timeCheck.hourUTC}:00 UTC`);
     }
 
     // ── Improvement 2: Volume Confirmation ───────────────────────────────

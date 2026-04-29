@@ -1,5 +1,5 @@
 {
-  "watchlist": ["BTCUSDT", "ETHUSDT", "RNDRUSDT"],
+  "watchlist": ["BTCUSDT", "ETHUSDT", "RNDRUSDT", "SOLUSDT", "SUIUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT"],
   "default_timeframe": "4H",
 
   "strategy": {
@@ -30,8 +30,8 @@
 
   "filters": {
     "time_filter": {
-      "rule": "No trades between 01:00–05:59 UTC",
-      "reason": "Lowest liquidity window globally. Wide spreads, high slippage risk, thin order books."
+      "rule": "No trades between 01:00–05:59 UTC — exception: RSI(3) > 80 or RSI(3) < 20 overrides the block",
+      "reason": "Lowest liquidity window globally. Wide spreads, high slippage risk, thin order books. Strong RSI signals (extreme overbought/oversold) are allowed through as the edge outweighs the liquidity risk."
     },
     "volume_confirmation": {
       "rule": "Current candle volume must be >= 60% of the 20-candle average",
@@ -94,5 +94,5 @@
     "Claude regime filter blocks trades during macro events"
   ],
 
-  "notes": "4H timeframe primary. RSI(3) is intentionally fast and sensitive — it fires quickly and exits quickly. Claude regime filter uses claude-haiku for speed and cost efficiency. All decisions logged to safety-check-log.json. All trades (blocked or executed) logged to trades.csv."
+  "notes": "4H timeframe primary. RSI(3) is intentionally fast and sensitive — it fires quickly and exits quickly. Claude regime filter uses claude-haiku for speed and cost efficiency. Bot runs every 30 minutes to catch RSI spikes and volume threshold crossings faster. All decisions logged to safety-check-log.json. All trades (blocked or executed) logged to trades.csv."
 }
