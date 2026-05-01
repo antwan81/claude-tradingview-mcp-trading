@@ -196,7 +196,7 @@ function checkVolume(candles) {
   const avgVol = volumes.reduce((a, b) => a + b, 0) / volumes.length;
   const currentVol = candles[candles.length - 1].volume;
   const ratio = currentVol / avgVol;
-  return { pass: ratio >= 0.6, currentVol, avgVol, ratio };
+  return { pass: ratio >= 0.45, currentVol, avgVol, ratio };
 }
 
 // ─── Improvement 3: Multi-Timeframe Confirmation ──────────────────────────────

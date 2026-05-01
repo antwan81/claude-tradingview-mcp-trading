@@ -34,8 +34,8 @@
       "reason": "Lowest liquidity window globally. Wide spreads, high slippage risk, thin order books. Strong RSI signals (extreme overbought/oversold) are allowed through as the edge outweighs the liquidity risk."
     },
     "volume_confirmation": {
-      "rule": "Current candle volume must be >= 60% of the 20-candle average",
-      "reason": "Low volume signals disinterest. Entries on thin volume produce worse fills and higher slippage. Threshold lowered from 80% to 60% to allow trading during normal post-breakout consolidation without including genuine dead markets."
+      "rule": "Current candle volume must be >= 45% of the 20-candle average",
+      "reason": "Low volume signals disinterest. Entries on thin volume produce worse fills and higher slippage. Threshold lowered from 80% to 60% to 45% — current market conditions show consistently low volume relative to inflated historical averages, causing valid RSI signals to be blocked."
     },
     "multi_timeframe": {
       "rule": "1H bias must be directionally clear (bullish or bearish) and align with 4H signal",
