@@ -707,7 +707,12 @@ async function run() {
       continue;
     }
     const mtfBias = mtf.bullish1h ? "BULLISH" : "BEARISH";
-    console.log(`✅ 1H bias: ${mtfBias} — confirms trade direction`);
+    const bias4h = price > vwap && price > ema8 ? "BULLISH" : price < vwap && price < ema8 ? "BEARISH" : "NEUTRAL";
+    if (mtfBias !== bias4h) {
+      console.log(`🚫 1H bias (${mtfBias}) conflicts with 4H bias (${bias4h}) — no aligned setup. Skipping.`);
+      continue;
+    }
+    console.log(`✅ 1H bias: ${mtfBias} — aligned with 4H bias`);
 
     // ── Improvement 6: Correlation Filter ────────────────────────────────
     console.log("\n── Correlation Filter ───────────────────────────────────\n");
