@@ -128,33 +128,53 @@ function countTodaysTrades(log) {
 // ─── Market Data (Binance public API — free, no auth) ───────────────────────
 
 async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
-  const intervalMap = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1H": "1h",
-    "4H": "4h",
-    "1D": "1d",
-    "1W": "1w",
+  // OKX interval mapping (primary — no geo-blocking)
+  const okxIntervalMap = {
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W",
   };
-  const binanceInterval = intervalMap[interval] || "1m";
+  // Binance fallback mapping
+  const binanceIntervalMap = {
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w",
+  };
 
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
-  const data = await res.json();
+  // Convert BTCUSDT → BTC-USDT for OKX
+  const okxSymbol = symbol.replace("USDT", "-USDT");
 
-  return data.map((k) => ({
-    time: k[0],
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-  }));
+  // Try OKX first
+  try {
+    const okxInterval = okxIntervalMap[interval] || "1H";
+    const url = `https://www.okx.com/api/v5/market/candles?instId=${okxSymbol}&bar=${okxInterval}&limit=${limit}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`OKX API error: ${res.status}`);
+    const json = await res.json();
+    if (json.code !== "0") throw new Error(`OKX error: ${json.msg}`);
+    // OKX returns newest-first — reverse to get chronological order
+    return json.data.reverse().map((k) => ({
+      time: parseInt(k[0]),
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }));
+  } catch (okxErr) {
+    // Fallback to Binance
+    const binanceInterval = binanceIntervalMap[interval] || "1m";
+    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
+    const data = await res.json();
+    return data.map((k) => ({
+      time: k[0],
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }));
+  }
 }
 
 // ─── Improvement 1: Claude Regime Filter ─────────────────────────────────────
@@ -653,7 +673,7 @@ async function run() {
     console.log(`${"═".repeat(59)}`);
 
     // Fetch candle data
-    console.log("\n── Fetching market data from Binance ───────────────────\n");
+    console.log("\n── Fetching market data (OKX → Binance fallback) ───────\n");
     const candles = await fetchCandles(symbol, CONFIG.timeframe, 500);
     const closes = candles.map((c) => c.close);
     const price = closes[closes.length - 1];
