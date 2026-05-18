@@ -426,6 +426,51 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
   return { results, allPass };
 }
 
+// ─── Trend-Following Check ───────────────────────────────────────────────────
+// Fires when EMA(8) and EMA(21) are aligned with price + RSI in momentum zone.
+// Captures sustained directional moves that snap-back misses (RSI stuck at 0/100).
+
+function runTrendCheck(price, ema8, ema21, vwap, rsi3) {
+  const results = [];
+
+  const check = (label, required, actual, pass) => {
+    results.push({ label, required, actual, pass });
+    const icon = pass ? "✅" : "🚫";
+    console.log(`  ${icon} ${label}`);
+    console.log(`     Required: ${required} | Actual: ${actual}`);
+  };
+
+  console.log("\n── Trend Mode Check ─────────────────────────────────────\n");
+
+  const bullishTrend = price > vwap && price > ema8 && ema8 > ema21;
+  const bearishTrend = price < vwap && price < ema8 && ema8 < ema21;
+
+  if (bullishTrend) {
+    console.log("  Trend: BULLISH — EMA(8) > EMA(21), checking momentum long\n");
+    check("Price above VWAP (buyers in control)", `> ${vwap.toFixed(2)}`, price.toFixed(2), price > vwap);
+    check("Price above EMA(8) (uptrend confirmed)", `> ${ema8.toFixed(2)}`, price.toFixed(2), price > ema8);
+    check("EMA(8) above EMA(21) (trend confirmed)", `> ${ema21.toFixed(2)}`, ema8.toFixed(2), ema8 > ema21);
+    check("RSI(3) in momentum zone 40–65 (not overbought)", "40–65", rsi3.toFixed(2), rsi3 >= 40 && rsi3 <= 65);
+    const dist = Math.abs((price - vwap) / vwap) * 100;
+    check("Price within 1.5% of VWAP (not overextended)", "< 1.5%", `${dist.toFixed(2)}%`, dist < 1.5);
+  } else if (bearishTrend) {
+    console.log("  Trend: BEARISH — EMA(8) < EMA(21), checking momentum short\n");
+    check("Price below VWAP (sellers in control)", `< ${vwap.toFixed(2)}`, price.toFixed(2), price < vwap);
+    check("Price below EMA(8) (downtrend confirmed)", `< ${ema8.toFixed(2)}`, price.toFixed(2), price < ema8);
+    check("EMA(8) below EMA(21) (trend confirmed)", `< ${ema21.toFixed(2)}`, ema8.toFixed(2), ema8 < ema21);
+    check("RSI(3) in momentum zone 35–60 (not oversold)", "35–60", rsi3.toFixed(2), rsi3 >= 35 && rsi3 <= 60);
+    const dist = Math.abs((price - vwap) / vwap) * 100;
+    check("Price within 1.5% of VWAP (not overextended)", "< 1.5%", `${dist.toFixed(2)}%`, dist < 1.5);
+  } else {
+    console.log("  Trend: NEUTRAL — EMAs not aligned with price structure. No trend entry.\n");
+    results.push({ label: "Trend alignment", required: "EMA(8)/EMA(21)/price aligned", actual: "Not aligned", pass: false });
+  }
+
+  const allPass = results.every((r) => r.pass);
+  const direction = bullishTrend ? "LONG" : bearishTrend ? "SHORT" : null;
+  return { results, allPass, direction };
+}
+
 // ─── Trade Limits ────────────────────────────────────────────────────────────
 
 function checkTradeLimits(log) {
@@ -681,11 +726,13 @@ async function run() {
 
     // Calculate indicators
     const ema8 = calcEMA(closes, 8);
+    const ema21 = calcEMA(closes, 21);
     const vwap = calcVWAP(candles);
     const rsi3 = calcRSI(closes, 3);
     const atr = calcATR(candles);
 
     console.log(`  EMA(8):  $${ema8.toFixed(4)}`);
+    console.log(`  EMA(21): $${ema21.toFixed(4)} ${ema8 > ema21 ? "↑ bullish" : "↓ bearish"}`);
     console.log(`  VWAP:    $${vwap ? vwap.toFixed(4) : "N/A"}`);
     console.log(`  RSI(3):  ${rsi3 !== null ? rsi3.toFixed(2) : "N/A"}`);
     console.log(`  ATR(14): $${atr.toFixed(4)}`);
@@ -743,8 +790,21 @@ async function run() {
     }
     console.log(`✅ No correlated asset already traded this run`);
 
-    // Run safety check
-    const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+    // ── Snap-back check (primary entry mode) ─────────────────────────────
+    const snapBack = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+    let finalAllPass = snapBack.allPass;
+    let entryMode = "SNAP-BACK";
+    let tradeDirection = (price > vwap && price > ema8) ? "LONG" : "SHORT";
+
+    // ── Trend-following check (fallback if snap-back fails) ───────────────
+    if (!snapBack.allPass) {
+      const trend = runTrendCheck(price, ema8, ema21, vwap, rsi3);
+      if (trend.allPass) {
+        finalAllPass = true;
+        entryMode = "TREND";
+        tradeDirection = trend.direction;
+      }
+    }
 
     // ── Improvement 5: ATR Position Sizing ───────────────────────────────
     const tradeSize = calcATRPositionSize(price, atr, CONFIG.portfolioValue, CONFIG.maxTradeSizeUSD);
@@ -760,9 +820,11 @@ async function run() {
       symbol,
       timeframe: CONFIG.timeframe,
       price,
-      indicators: { ema8, vwap, rsi3 },
-      conditions: results,
-      allPass,
+      indicators: { ema8, ema21, vwap, rsi3 },
+      conditions: snapBack.results,
+      allPass: finalAllPass,
+      entryMode,
+      tradeDirection,
       tradeSize,
       orderPlaced: false,
       orderId: null,
@@ -774,8 +836,8 @@ async function run() {
       },
     };
 
-    if (!allPass) {
-      const failed = results.filter((r) => !r.pass).map((r) => r.label);
+    if (!finalAllPass) {
+      const failed = snapBack.results.filter((r) => !r.pass).map((r) => r.label);
       console.log(`🚫 TRADE BLOCKED`);
       console.log(`   Failed conditions:`);
       failed.forEach((f) => console.log(`   - ${f}`));
@@ -791,28 +853,36 @@ async function run() {
         continue;
       }
       console.log(`✅ Regime approved — ${regime.reason}`);
-      console.log(`\n✅ ALL CONDITIONS MET`);
+      console.log(`\n✅ ALL CONDITIONS MET — Entry mode: ${entryMode} | Direction: ${tradeDirection}`);
 
-      if (CONFIG.paperTrading) {
-        console.log(
-          `\n📋 PAPER TRADE — would buy ${symbol} ~$${tradeSize.toFixed(2)} at market`,
+      // Spot exchange: can only BUY. TREND SHORT = signal logged, no order.
+      if (tradeDirection === "SHORT" && entryMode === "TREND") {
+        console.log(`\n⚠️  TREND SHORT signal on spot exchange — logging signal, no order placed.`);
+        console.log(`   (Spot trading cannot short — signal recorded for reference)`);
+        logEntry.orderId = `TREND-SHORT-SIGNAL-${Date.now()}`;
+        await sendTelegram(
+          `📉 *TREND SHORT SIGNAL — ${symbol}*\n` +
+          `Price: $${price.toFixed(4)} | RSI(3): ${rsi3.toFixed(2)}\n` +
+          `EMA8: $${ema8.toFixed(4)} < EMA21: $${ema21.toFixed(4)}\n` +
+          `⚠️ Spot only — no order placed. Monitor for reversal.`
         );
-        console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
+      } else if (CONFIG.paperTrading) {
+        const side = tradeDirection === "SHORT" ? "SELL" : "BUY";
+        console.log(`\n📋 PAPER TRADE — would ${side} ${symbol} ~$${tradeSize.toFixed(2)} at market`);
+        console.log(`   Mode: ${entryMode} | (Set PAPER_TRADING=false in .env to place real orders)`);
         logEntry.orderPlaced = true;
         logEntry.orderId = `PAPER-${Date.now()}`;
         executedThisRun.push(symbol);
         await sendTelegram(
           `📋 *PAPER TRADE — ${symbol}*\n` +
-          `Side: BUY | Size: $${tradeSize.toFixed(2)} | Price: $${price.toFixed(4)}\n` +
-          `RSI(3): ${rsi3.toFixed(2)} | EMA8: $${ema8.toFixed(4)} | VWAP: $${vwap.toFixed(4)}\n` +
+          `Mode: ${entryMode} | Side: ${side} | Size: $${tradeSize.toFixed(2)} | Price: $${price.toFixed(4)}\n` +
+          `RSI(3): ${rsi3.toFixed(2)} | EMA8: $${ema8.toFixed(4)} | EMA21: $${ema21.toFixed(4)} | VWAP: $${vwap.toFixed(4)}\n` +
           `ATR size: $${tradeSize.toFixed(2)} | 1H bias: ${mtfBias}\n` +
           `Regime: ${regime.reason}\n` +
           `_Paper mode — no real order placed_`
         );
       } else {
-        console.log(
-          `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${symbol}`,
-        );
+        console.log(`\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${symbol} [${entryMode}]`);
         try {
           const order = await placeBitGetOrder(symbol, "buy", tradeSize, price);
           logEntry.orderPlaced = true;
@@ -821,9 +891,9 @@ async function run() {
           console.log(`✅ ORDER PLACED — ${order.orderId}`);
           await sendTelegram(
             `✅ *LIVE TRADE EXECUTED — ${symbol}*\n` +
-            `Side: BUY | Size: $${tradeSize.toFixed(2)} | Price: $${price.toFixed(4)}\n` +
+            `Mode: ${entryMode} | Side: BUY | Size: $${tradeSize.toFixed(2)} | Price: $${price.toFixed(4)}\n` +
             `Order ID: ${order.orderId}\n` +
-            `RSI(3): ${rsi3.toFixed(2)} | ATR size: $${tradeSize.toFixed(2)} | 1H: ${mtfBias}\n` +
+            `RSI(3): ${rsi3.toFixed(2)} | EMA8/21: $${ema8.toFixed(2)}/$${ema21.toFixed(2)} | 1H: ${mtfBias}\n` +
             `Regime: ${regime.reason}`
           );
         } catch (err) {
