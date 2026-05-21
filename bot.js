@@ -508,56 +508,149 @@ function checkTradeLimits(log) {
   return true;
 }
 
-// ─── BitGet Execution ────────────────────────────────────────────────────────
+// ─── Coinbase Advanced Execution ─────────────────────────────────────────────
 
-function signBitGet(timestamp, method, path, body = "") {
-  const message = `${timestamp}${method}${path}${body}`;
-  return crypto
-    .createHmac("sha256", CONFIG.bitget.secretKey)
-    .update(message)
-    .digest("base64");
+function buildCoinbaseJWT(method, path) {
+  const keyName = CONFIG.bitget.apiKey; // organizations/.../apiKeys/...
+  const privateKeyPem = CONFIG.bitget.secretKey.replace(/\\n/g, "\n");
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = {
+    alg: "ES256",
+    kid: keyName,
+    nonce: crypto.randomBytes(16).toString("hex"),
+  };
+  const payload = {
+    sub: keyName,
+    iss: "cdp",
+    nbf: now,
+    exp: now + 120,
+    aud: ["retail_rest_api_proxy"],
+    uri: `${method} api.coinbase.com${path}`,
+  };
+
+  const headerB64 = Buffer.from(JSON.stringify(header)).toString("base64url");
+  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signingInput = `${headerB64}.${payloadB64}`;
+
+  const sign = crypto.createSign("SHA256");
+  sign.update(signingInput);
+  sign.end();
+  const sigBuf = sign.sign({ key: privateKeyPem, dsaEncoding: "ieee-p1363" });
+  return `${signingInput}.${sigBuf.toString("base64url")}`;
 }
 
-async function placeBitGetOrder(symbol, side, sizeUSD, price) {
-  const quantity = (sizeUSD / price).toFixed(6);
-  const timestamp = Date.now().toString();
-  const path =
-    CONFIG.tradeMode === "spot"
-      ? "/api/v2/spot/trade/placeOrder"
-      : "/api/v2/mix/order/placeOrder";
+async function coinbaseGet(path) {
+  const jwt = buildCoinbaseJWT("GET", path);
+  const res = await fetch(`https://api.coinbase.com${path}`, {
+    headers: { Authorization: `Bearer ${jwt}` },
+  });
+  if (!res.ok) throw new Error(`Coinbase GET ${path} — HTTP ${res.status}`);
+  return res.json();
+}
+
+async function placeCoinbaseOrder(symbol, side, sizeUSD) {
+  const productId = symbol.replace("USDT", "-USDC"); // SOLUSDT → SOL-USDC
+  const path = "/api/v3/brokerage/orders";
+  const jwt = buildCoinbaseJWT("POST", path);
 
   const body = JSON.stringify({
-    symbol,
-    side,
-    orderType: "market",
-    quantity,
-    ...(CONFIG.tradeMode === "futures" && {
-      productType: "USDT-FUTURES",
-      marginMode: "isolated",
-      marginCoin: "USDT",
-    }),
+    client_order_id: crypto.randomUUID(),
+    product_id: productId,
+    side: side.toUpperCase(),
+    order_configuration: {
+      market_market_ioc: {
+        quote_size: sizeUSD.toFixed(2), // spend $X on market buy
+      },
+    },
   });
 
-  const signature = signBitGet(timestamp, "POST", path, body);
-
-  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
+  const res = await fetch(`https://api.coinbase.com${path}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "ACCESS-KEY": CONFIG.bitget.apiKey,
-      "ACCESS-SIGN": signature,
-      "ACCESS-TIMESTAMP": timestamp,
-      "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
+      Authorization: `Bearer ${jwt}`,
     },
     body,
   });
 
   const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
+  if (!data.success) {
+    const msg =
+      data.error_response?.message || data.error || JSON.stringify(data);
+    throw new Error(`Coinbase order failed: ${msg}`);
   }
 
-  return data.data;
+  return {
+    orderId: data.success_response?.order_id || "unknown",
+    ...data.success_response,
+  };
+}
+
+// ─── Portfolio Exposure Check ─────────────────────────────────────────────────
+// Blocks trades that would add to already oversized or over-concentrated positions.
+// Uses the accounts API (works reliably) rather than portfolio breakdown (restricted).
+//
+// Check 1 — Absolute holding value: skip if current holdings worth > $80 USDC.
+//   Catches: SOL (~$139), AVAX (~$97) — both flagged in the portfolio review.
+//
+// Check 2 — Concentration vs USDC: skip if holding > 50% of available USDC.
+//   Secondary guardrail: prevents doubling down when cash is already low.
+
+const EXPOSURE_MAX_HOLDING_USD  = 80;  // block if holding already worth > $80
+const EXPOSURE_MAX_VS_USDC_PCT  = 50;  // block if holding > 50% of USDC balance
+
+async function runPortfolioExposureCheck(symbol, price) {
+  const baseCurrency = symbol.replace("USDT", ""); // SOLUSDT → SOL
+
+  console.log(`\n── Portfolio Exposure Check ──────────────────────────────\n`);
+  console.log(`  Checking ${baseCurrency} holdings on Coinbase...`);
+
+  try {
+    const data = await coinbaseGet("/api/v3/brokerage/accounts");
+    const accounts = data.accounts || [];
+
+    const usdcAcct  = accounts.find((a) => a.currency === "USDC");
+    const assetAcct = accounts.find((a) => a.currency === baseCurrency);
+
+    const usdcBalance  = parseFloat(usdcAcct?.available_balance?.value  || 0);
+    const assetBalance = parseFloat(assetAcct?.available_balance?.value || 0);
+    const holdingValue = assetBalance * price; // current value in USDC terms
+
+    if (assetBalance === 0) {
+      console.log(`  ✅ No existing ${baseCurrency} holdings — clear to trade`);
+      return { pass: true, reason: "No existing position" };
+    }
+
+    const vsUsdcPct = usdcBalance > 0 ? (holdingValue / usdcBalance) * 100 : 0;
+
+    const results = [
+      {
+        label: `${baseCurrency} holding value`,
+        required: `< $${EXPOSURE_MAX_HOLDING_USD} USDC`,
+        actual: `$${holdingValue.toFixed(2)} (${assetBalance.toFixed(4)} ${baseCurrency})`,
+        pass: holdingValue < EXPOSURE_MAX_HOLDING_USD,
+      },
+      {
+        label: `Concentration vs USDC balance`,
+        required: `< ${EXPOSURE_MAX_VS_USDC_PCT}% of $${usdcBalance.toFixed(2)} USDC`,
+        actual: `${vsUsdcPct.toFixed(1)}%`,
+        pass: vsUsdcPct < EXPOSURE_MAX_VS_USDC_PCT,
+      },
+    ];
+
+    results.forEach((r) => {
+      console.log(`  ${r.pass ? "✅" : "🚫"} ${r.label}`);
+      console.log(`     Required: ${r.required} | Actual: ${r.actual}`);
+    });
+
+    const allPass = results.every((r) => r.pass);
+    return { pass: allPass, results, holdingValue, usdcBalance, assetBalance };
+
+  } catch (err) {
+    console.log(`  ⚠️  Portfolio check error: ${err.message} — proceeding`);
+    return { pass: true, reason: `Check skipped: ${err.message}` };
+  }
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
@@ -635,7 +728,7 @@ function writeTradeCsv(logEntry) {
   const row = [
     date,
     time,
-    "BitGet",
+    "Coinbase Advanced",
     logEntry.symbol,
     side,
     quantity,
@@ -853,6 +946,29 @@ async function run() {
         continue;
       }
       console.log(`✅ Regime approved — ${regime.reason}`);
+
+      // ── Portfolio Exposure Check ────────────────────────────────────────
+      // Only runs for BUY signals — skip for TREND SHORT (no order placed anyway)
+      if (!(tradeDirection === "SHORT" && entryMode === "TREND")) {
+        const exposure = await runPortfolioExposureCheck(symbol, price);
+        logEntry.exposureCheck = exposure;
+        if (!exposure.pass) {
+          const blocked = (exposure.results || [])
+            .filter((r) => !r.pass)
+            .map((r) => r.label)
+            .join(", ");
+          console.log(`\n🚫 EXPOSURE BLOCKED — ${blocked}`);
+          const baseCurrency = symbol.replace("USDT", "");
+          await sendTelegram(
+            `⚠️ *EXPOSURE BLOCK — ${symbol}*\n` +
+            `${baseCurrency} holding: $${exposure.holdingValue?.toFixed(2)} (limit $${EXPOSURE_MAX_HOLDING_USD})\n` +
+            `USDC balance: $${exposure.usdcBalance?.toFixed(2)}\n` +
+            `Not adding to an oversized position.`
+          );
+          continue;
+        }
+      }
+
       console.log(`\n✅ ALL CONDITIONS MET — Entry mode: ${entryMode} | Direction: ${tradeDirection}`);
 
       // Spot exchange: can only BUY. TREND SHORT = signal logged, no order.
@@ -884,7 +1000,7 @@ async function run() {
       } else {
         console.log(`\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${symbol} [${entryMode}]`);
         try {
-          const order = await placeBitGetOrder(symbol, "buy", tradeSize, price);
+          const order = await placeCoinbaseOrder(symbol, "buy", tradeSize);
           logEntry.orderPlaced = true;
           logEntry.orderId = order.orderId;
           executedThisRun.push(symbol);
